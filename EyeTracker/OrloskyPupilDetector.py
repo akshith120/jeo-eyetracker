@@ -16,15 +16,15 @@ class TrackerConfig:
     FACE_MIN_SIZE = (60, 60)
     EYE_MIN_SIZE = (20, 20)
     IGNORE_BOUNDS = 10
-    IMAGE_SKIP_SIZE = 8
-    SEARCH_AREA = 15
-    INTERNAL_SKIP_SIZE = 4
+    IMAGE_SKIP_SIZE = 10
+    SEARCH_AREA = 20
+    INTERNAL_SKIP_SIZE = 5
     THRESHOLD_STRICT = 5
     THRESHOLD_MEDIUM = 15
     THRESHOLD_RELAXED = 25
     MASK_SIZE = 150
-    MIN_CONTOUR_AREA = 50
-    MAX_CONTOUR_AREA = 5000
+    MIN_CONTOUR_AREA = 30
+    MAX_CONTOUR_AREA = 3000
     MAX_ASPECT_RATIO = 3.0
     MIN_CIRCULARITY = 0.4
     MIN_POINTS_FOR_ELLIPSE = 5
@@ -135,22 +135,71 @@ def detect_face_and_eyes(frame, draw_rectangles=False):
         eye_regions.append((new_x, new_y, new_x2 - new_x, new_y2 - new_y))
     return eye_regions if len(eye_regions) > 0 else None
 
+# Cache for previous darkest point to enable tracking
+_previous_darkest = None
+_darkest_cache_frames = 0
+
 def get_darkest_area(gray_image):
+    """Optimized darkest area search with caching and smart search"""
+    global _previous_darkest, _darkest_cache_frames
     cfg = TrackerConfig
     h, w = gray_image.shape
-    y_samples = np.arange(cfg.IGNORE_BOUNDS, h - cfg.IGNORE_BOUNDS, cfg.IMAGE_SKIP_SIZE)
-    x_samples = np.arange(cfg.IGNORE_BOUNDS, w - cfg.IGNORE_BOUNDS, cfg.IMAGE_SKIP_SIZE)
-    min_sum = float('inf')
-    darkest_point = (w // 2, h // 2)
-    for y in y_samples:
-        for x in x_samples:
-            y_end = min(y + cfg.SEARCH_AREA, h)
-            x_end = min(x + cfg.SEARCH_AREA, w)
-            region = gray_image[y:y_end:cfg.INTERNAL_SKIP_SIZE, x:x_end:cfg.INTERNAL_SKIP_SIZE]
-            current_sum = np.sum(region, dtype=np.int64)
-            if current_sum < min_sum:
-                min_sum = current_sum
-                darkest_point = (x + cfg.SEARCH_AREA // 2, y + cfg.SEARCH_AREA // 2)
+    
+    # If we have a recent previous point, search nearby first
+    if _previous_darkest is not None and _darkest_cache_frames < 5:
+        px, py = _previous_darkest
+        search_radius = 30
+        
+        y_min = max(cfg.IGNORE_BOUNDS, py - search_radius)
+        y_max = min(h - cfg.IGNORE_BOUNDS, py + search_radius)
+        x_min = max(cfg.IGNORE_BOUNDS, px - search_radius)
+        x_max = min(w - cfg.IGNORE_BOUNDS, px + search_radius)
+        
+        # Sample local region more densely
+        local_region = gray_image[y_min:y_max:3, x_min:x_max:3]
+        if local_region.size > 0:
+            min_idx = np.argmin(local_region)
+            local_y, local_x = np.unravel_index(min_idx, local_region.shape)
+            darkest_point = (int(x_min + local_x * 3), int(y_min + local_y * 3))
+            _previous_darkest = darkest_point
+            _darkest_cache_frames += 1
+            return darkest_point
+    
+    # Full search with very aggressive sampling (only when needed)
+    _darkest_cache_frames = 0
+    step = cfg.IMAGE_SKIP_SIZE * 2  # Even larger steps
+    
+    # Use numpy's built-in optimized functions
+    # Sample the image sparsely
+    sampled = gray_image[cfg.IGNORE_BOUNDS:-cfg.IGNORE_BOUNDS:step, 
+                        cfg.IGNORE_BOUNDS:-cfg.IGNORE_BOUNDS:step]
+    
+    if sampled.size == 0:
+        darkest_point = (w // 2, h // 2)
+    else:
+        # Find minimum in sampled grid
+        min_idx = np.argmin(sampled)
+        sample_y, sample_x = np.unravel_index(min_idx, sampled.shape)
+        
+        # Convert back to original coordinates
+        y = cfg.IGNORE_BOUNDS + sample_y * step
+        x = cfg.IGNORE_BOUNDS + sample_x * step
+        
+        # Refine search in small local area
+        y_min = max(0, y - step)
+        y_max = min(h, y + step)
+        x_min = max(0, x - step)
+        x_max = min(w, x + step)
+        
+        local = gray_image[y_min:y_max, x_min:x_max]
+        if local.size > 0:
+            min_idx_local = np.argmin(local)
+            local_y, local_x = np.unravel_index(min_idx_local, local.shape)
+            darkest_point = (int(x_min + local_x), int(y_min + local_y))
+        else:
+            darkest_point = (int(x), int(y))
+    
+    _previous_darkest = darkest_point
     return darkest_point
 
 #mask all pixels outside a square defined by center and size
@@ -478,6 +527,11 @@ def process_video(video_path, input_method):
             if frame_count % cfg.FACE_DETECTION_INTERVAL == 0:
                 eye_regions = detect_face_and_eyes(gray_full, draw_rectangles=debug_mode_on)
                 if eye_regions is not None and len(eye_regions) > 0:
+                    # Reset darkest cache when ROI changes
+                    if cached_roi is None or abs(eye_regions[0][0] - cached_roi[0]) > 20:
+                        global _previous_darkest, _darkest_cache_frames
+                        _previous_darkest = None
+                        _darkest_cache_frames = 0
                     cached_roi = eye_regions[0]
                     current_roi = cached_roi
                 else:
@@ -503,7 +557,10 @@ def process_video(video_path, input_method):
             timing_stats.add('roi', time.time() - t_roi)
         t_prep = time.time() if cfg.ENABLE_TIMING else 0
         gray_frame = crop_to_aspect_ratio(gray_frame, cfg.CAMERA_WIDTH, cfg.CAMERA_HEIGHT)
+        t_darkest = time.time() if cfg.ENABLE_TIMING else 0
         darkest_point = get_darkest_area(gray_frame)
+        if cfg.ENABLE_TIMING and frame_count % 30 == 0:
+            print(f"  Darkest search: {(time.time() - t_darkest)*1000:.1f}ms")
         darkest_pixel_value = gray_frame[darkest_point[1], darkest_point[0]]
         thresholded_image_strict = apply_binary_threshold(gray_frame, darkest_pixel_value, cfg.THRESHOLD_STRICT)
         thresholded_image_strict = mask_outside_square(thresholded_image_strict, darkest_point, cfg.MASK_SIZE)
