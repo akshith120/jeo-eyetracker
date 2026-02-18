@@ -1,11 +1,60 @@
 import cv2
 import numpy as np
-import random
-import math
+import time
 import tkinter as tk
 import os
 from tkinter import filedialog
-import matplotlib.pyplot as plt
+
+# Configuration class for all tunable parameters
+class TrackerConfig:
+    CAMERA_WIDTH = 320
+    CAMERA_HEIGHT = 240
+    FORCE_GRAYSCALE = True
+    ROI_EXPAND_FACTOR = 1.3
+    ROI_MIN_SIZE = 60
+    FACE_DETECTION_INTERVAL = 10
+    FACE_MIN_SIZE = (60, 60)
+    EYE_MIN_SIZE = (20, 20)
+    IGNORE_BOUNDS = 10
+    IMAGE_SKIP_SIZE = 8
+    SEARCH_AREA = 15
+    INTERNAL_SKIP_SIZE = 4
+    THRESHOLD_STRICT = 5
+    THRESHOLD_MEDIUM = 15
+    THRESHOLD_RELAXED = 25
+    MASK_SIZE = 150
+    MIN_CONTOUR_AREA = 50
+    MAX_CONTOUR_AREA = 5000
+    MAX_ASPECT_RATIO = 3.0
+    MIN_CIRCULARITY = 0.4
+    MIN_POINTS_FOR_ELLIPSE = 5
+    KERNEL_SIZE = 3
+    DILATION_ITERATIONS = 1
+    DRAW_ONLY_ESSENTIALS = True
+    TIMING_LOG_INTERVAL = 60
+    ENABLE_TIMING = True
+
+class TimingStats:
+    def __init__(self):
+        self.reset()
+    def reset(self):
+        self.capture_time = []
+        self.roi_time = []
+        self.preprocess_time = []
+        self.contour_time = []
+        self.viz_time = []
+        self.total_time = []
+    def add(self, stage, duration):
+        getattr(self, f"{stage}_time").append(duration)
+    def get_averages(self):
+        stages = ['capture', 'roi', 'preprocess', 'contour', 'viz', 'total']
+        avgs = {}
+        for stage in stages:
+            times = getattr(self, f"{stage}_time")
+            avgs[stage] = sum(times) / len(times) if times else 0
+        return avgs
+
+timing_stats = TimingStats()
 
 # Initialize face and eye cascade classifiers
 try:
@@ -14,27 +63,23 @@ try:
     FACE_DETECTION_AVAILABLE = True
 except:
     FACE_DETECTION_AVAILABLE = False
-    print("Warning: Face/eye detection not available. Will process full frame.")
 
-# Crop the image to maintain a specific aspect ratio (width:height) before resizing. 
-def crop_to_aspect_ratio(image, width=640, height=480):
-    
-    # Calculate current aspect ratio
+def crop_to_aspect_ratio(image, width=None, height=None):
+    if width is None:
+        width = TrackerConfig.CAMERA_WIDTH
+    if height is None:
+        height = TrackerConfig.CAMERA_HEIGHT
     current_height, current_width = image.shape[:2]
     desired_ratio = width / height
     current_ratio = current_width / current_height
-
     if current_ratio > desired_ratio:
-        # Current image is too wide
         new_width = int(desired_ratio * current_height)
         offset = (current_width - new_width) // 2
         cropped_img = image[:, offset:offset+new_width]
     else:
-        # Current image is too tall
         new_height = int(current_width / desired_ratio)
         offset = (current_height - new_height) // 2
         cropped_img = image[offset:offset+new_height, :]
-
     return cv2.resize(cropped_img, (width, height))
 
 #apply thresholding to an image
@@ -46,44 +91,37 @@ def apply_binary_threshold(image, darkestPixelValue, addedThreshold):
     
     return thresholded_image
 
-#Detects face and eyes in the frame, returns cropped eye regions
-#@param frame input image
-#@return list of eye regions [(x, y, w, h), ...] or None if no face/eyes detected
 def detect_face_and_eyes(frame, draw_rectangles=False):
     if not FACE_DETECTION_AVAILABLE:
         return None
-    
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
-    # Detect faces
-    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(100, 100))
-    
+    if len(frame.shape) == 3:
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    else:
+        gray = frame
+    faces = face_cascade.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=3, minSize=TrackerConfig.FACE_MIN_SIZE)
     if len(faces) == 0:
         return None
-    
-    # Get the largest face (closest to camera)
-    largest_face = max(faces, key=lambda f: f[2] * f[3])
-    fx, fy, fw, fh = largest_face
+    areas = faces[:, 2] * faces[:, 3]
+    largest_idx = np.argmax(areas)
+    fx, fy, fw, fh = faces[largest_idx]
     
     if draw_rectangles:
-        cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (255, 0, 0), 2)
-    
-    # Detect eyes within the face region
+        if len(frame.shape) == 2:
+            frame_color = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+        else:
+            frame_color = frame
+        cv2.rectangle(frame_color, (fx, fy), (fx + fw, fy + fh), (255, 0, 0), 2)
     face_roi_gray = gray[fy:fy+fh, fx:fx+fw]
-    eyes = eye_cascade.detectMultiScale(face_roi_gray, scaleFactor=1.05, minNeighbors=8, minSize=(30, 30))
+    eyes = eye_cascade.detectMultiScale(face_roi_gray, scaleFactor=1.1, minNeighbors=5, minSize=TrackerConfig.EYE_MIN_SIZE)
     
     if len(eyes) == 0:
         return None
     
-    # Convert eye coordinates to full frame coordinates
     eye_regions = []
+    expand = TrackerConfig.ROI_EXPAND_FACTOR
     for (ex, ey, ew, eh) in eyes:
-        # Add face offset
         abs_x = fx + ex
         abs_y = fy + ey
-        
-        # Expand eye region slightly for better pupil detection
-        expand = 1.3
         center_x = abs_x + ew // 2
         center_y = abs_y + eh // 2
         new_w = int(ew * expand)
@@ -92,51 +130,27 @@ def detect_face_and_eyes(frame, draw_rectangles=False):
         new_y = max(0, center_y - new_h // 2)
         new_x2 = min(frame.shape[1], new_x + new_w)
         new_y2 = min(frame.shape[0], new_y + new_h)
-        
-        if draw_rectangles:
-            cv2.rectangle(frame, (new_x, new_y), (new_x2, new_y2), (0, 255, 0), 2)
-        
+        if draw_rectangles and 'frame_color' in locals():
+            cv2.rectangle(frame_color, (new_x, new_y), (new_x2, new_y2), (0, 255, 0), 2)
         eye_regions.append((new_x, new_y, new_x2 - new_x, new_y2 - new_y))
-    
-    # Return the largest eye region (or both if you want to track both eyes)
     return eye_regions if len(eye_regions) > 0 else None
 
-#Finds a square area of dark pixels in the image
-#@param I input image (converted to grayscale during search process)
-#@return a point within the pupil region
-def get_darkest_area(image):
-
-    ignoreBounds = 20 #don't search the boundaries of the image for ignoreBounds pixels
-    imageSkipSize = 10 #only check the darkness of a block for every Nth x and y pixel (sparse sampling)
-    searchArea = 20 #the size of the block to search
-    internalSkipSize = 5 #skip every Nth x and y pixel in the local search area (sparse sampling)
-    
-    # Convert to grayscale
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
+def get_darkest_area(gray_image):
+    cfg = TrackerConfig
+    h, w = gray_image.shape
+    y_samples = np.arange(cfg.IGNORE_BOUNDS, h - cfg.IGNORE_BOUNDS, cfg.IMAGE_SKIP_SIZE)
+    x_samples = np.arange(cfg.IGNORE_BOUNDS, w - cfg.IGNORE_BOUNDS, cfg.IMAGE_SKIP_SIZE)
     min_sum = float('inf')
-    darkest_point = None
-
-    # Loop over the image with spacing defined by imageSkipSize, ignoring the boundaries
-    for y in range(ignoreBounds, gray.shape[0] - ignoreBounds, imageSkipSize):
-        for x in range(ignoreBounds, gray.shape[1] - ignoreBounds, imageSkipSize):
-            # Calculate sum of pixel values in the search area, skipping pixels based on internalSkipSize
-            current_sum = np.int64(0)
-            num_pixels = 0
-            for dy in range(0, searchArea, internalSkipSize):
-                if y + dy >= gray.shape[0]:
-                    break
-                for dx in range(0, searchArea, internalSkipSize):
-                    if x + dx >= gray.shape[1]:
-                        break
-                    current_sum += gray[y + dy][x + dx]
-                    num_pixels += 1
-
-            # Update the darkest point if the current block is darker
-            if current_sum < min_sum and num_pixels > 0:
+    darkest_point = (w // 2, h // 2)
+    for y in y_samples:
+        for x in x_samples:
+            y_end = min(y + cfg.SEARCH_AREA, h)
+            x_end = min(x + cfg.SEARCH_AREA, w)
+            region = gray_image[y:y_end:cfg.INTERNAL_SKIP_SIZE, x:x_end:cfg.INTERNAL_SKIP_SIZE]
+            current_sum = np.sum(region, dtype=np.int64)
+            if current_sum < min_sum:
                 min_sum = current_sum
-                darkest_point = (x + searchArea // 2, y + searchArea // 2)  # Center of the block
-
+                darkest_point = (x + cfg.SEARCH_AREA // 2, y + cfg.SEARCH_AREA // 2)
     return darkest_point
 
 #mask all pixels outside a square defined by center and size
@@ -213,54 +227,38 @@ def optimize_contours_by_angle(contours, image):
     
     return np.array(filtered_points, dtype=np.int32).reshape((-1, 1, 2))
 
-#returns the largest contour that is not extremely long or tall
-#contours is the list of contours, pixel_thresh is the max pixels to filter, and ratio_thresh is the max ratio
-def filter_contours_by_area_and_return_largest(contours, pixel_thresh, ratio_thresh):
-    max_area = 0
-    largest_contour = None
-    
+def filter_contours_by_area_and_return_largest(contours):
+    cfg = TrackerConfig
+    if len(contours) == 0:
+        return []
+    valid_contours = []
     for contour in contours:
         area = cv2.contourArea(contour)
-        if area >= pixel_thresh:
-            x, y, w, h = cv2.boundingRect(contour)
-            length = max(w, h)
-            width = min(w, h)
-
-            # Calculate the length-to-width ratio and width-to-length ratio
-            length_to_width_ratio = length / width
-            width_to_length_ratio = width / length
-
-            # Pick the higher of the two ratios
-            current_ratio = max(length_to_width_ratio, width_to_length_ratio)
-
-            # Check if highest ratio is within the acceptable threshold
-            if current_ratio <= ratio_thresh:
-                # Update the largest contour if the current one is bigger
-                if area > max_area:
-                    max_area = area
-                    largest_contour = contour
-
-    # Return a list with only the largest contour, or an empty list if no contour was found
-    if largest_contour is not None:
-        return [largest_contour]
-    else:
+        if area < cfg.MIN_CONTOUR_AREA or area > cfg.MAX_CONTOUR_AREA:
+            continue
+        x, y, w, h = cv2.boundingRect(contour)
+        aspect_ratio = max(w, h) / max(min(w, h), 1)
+        if aspect_ratio > cfg.MAX_ASPECT_RATIO:
+            continue
+        perimeter = cv2.arcLength(contour, True)
+        if perimeter == 0:
+            continue
+        circularity = 4 * np.pi * area / (perimeter * perimeter)
+        if circularity < cfg.MIN_CIRCULARITY:
+            continue
+        valid_contours.append((area, contour))
+    if not valid_contours:
         return []
+    largest = max(valid_contours, key=lambda x: x[0])
+    return [largest[1]]
 
-#Fits an ellipse to the optimized contours and draws it on the image.
 def fit_and_draw_ellipses(image, optimized_contours, color):
-    if len(optimized_contours) >= 5:
-        # Ensure the data is in the correct shape (n, 1, 2) for cv2.fitEllipse
+    if len(optimized_contours) >= TrackerConfig.MIN_POINTS_FOR_ELLIPSE:
         contour = np.array(optimized_contours, dtype=np.int32).reshape((-1, 1, 2))
-
-        # Fit ellipse
         ellipse = cv2.fitEllipse(contour)
-
-        # Draw the ellipse
-        cv2.ellipse(image, ellipse, color, 2)  # Draw with green color and thickness of 2
-
+        cv2.ellipse(image, ellipse, color, 2)
         return image
     else:
-        print("Not enough points to fit an ellipse.")
         return image
 
 #checks how many pixels in the contour fall under a slightly thickened ellipse
@@ -300,14 +298,10 @@ def check_contour_pixels(contour, image_shape, debug_mode_on):
     
     return [absolute_pixel_total_thick, ratio_under_ellipse, overlap_thin]
 
-#outside of this method, select the ellipse with the highest percentage of pixels under the ellipse 
-#TODO for efficiency, work with downscaled or cropped images
 def check_ellipse_goodness(binary_image, contour, debug_mode_on):
-    ellipse_goodness = [0,0,0] #covered pixels, edge straightness stdev, skewedness   
-    # Check if the contour can be used to fit an ellipse (requires at least 5 points)
-    if len(contour) < 5:
-        print("length of contour was 0")
-        return 0  # Not enough points to fit an ellipse
+    ellipse_goodness = [0, 0, 0]
+    if len(contour) < TrackerConfig.MIN_POINTS_FOR_ELLIPSE:
+        return ellipse_goodness
     
     # Fit an ellipse to the contour
     ellipse = cv2.fitEllipse(contour)
@@ -324,116 +318,62 @@ def check_ellipse_goodness(binary_image, contour, debug_mode_on):
     # Calculate the number of white pixels within the ellipse
     covered_pixels = np.sum((binary_image == 255) & (mask == 255))
     
-    # Calculate the percentage of covered white pixels within the ellipse
     if ellipse_area == 0:
-        print("area was 0")
-        return ellipse_goodness  # Avoid division by zero if the ellipse area is somehow zero
-    
-    #percentage of covered pixels to number of pixels under area
+        return ellipse_goodness
     ellipse_goodness[0] = covered_pixels / ellipse_area
-    
-    #skew of the ellipse (less skewed is better?) - may not need this
-    axes_lengths = ellipse[1]  # This is a tuple (minor_axis_length, major_axis_length)
+    axes_lengths = ellipse[1]
     major_axis_length = axes_lengths[1]
     minor_axis_length = axes_lengths[0]
-    ellipse_goodness[2] = min(ellipse[1][1]/ellipse[1][0], ellipse[1][0]/ellipse[1][1])
+    if major_axis_length > 0 and minor_axis_length > 0:
+        ellipse_goodness[2] = min(major_axis_length/minor_axis_length, minor_axis_length/major_axis_length)
     
     return ellipse_goodness
 
 def process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, render_cv_window):
-  
+    t_start = time.time() if TrackerConfig.ENABLE_TIMING else 0
+    cfg = TrackerConfig
     final_rotated_rect = ((0,0),(0,0),0)
+    image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict]
+    final_contours = []
+    goodness = 0
+    kernel = np.ones((cfg.KERNEL_SIZE, cfg.KERNEL_SIZE), np.uint8)
+    for i in range(1, 4):
+        dilated_image = cv2.dilate(image_array[i-1], kernel, iterations=cfg.DILATION_ITERATIONS)
+        contours, _ = cv2.findContours(dilated_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        reduced_contours = filter_contours_by_area_and_return_largest(contours)
 
-    image_array = [thresholded_image_relaxed, thresholded_image_medium, thresholded_image_strict] #holds images
-    name_array = ["relaxed", "medium", "strict"] #for naming windows
-    final_image = image_array[0] #holds return array
-    final_contours = [] #holds final contours
-    ellipse_reduced_contours = [] #holds an array of the best contour points from the fitting process
-    goodness = 0 #goodness value for best ellipse
-    best_array = 0 
-    kernel_size = 5  # Size of the kernel (5x5)
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    gray_copy1 = gray_frame.copy()
-    gray_copy2 = gray_frame.copy()
-    gray_copy3 = gray_frame.copy()
-    gray_copies = [gray_copy1, gray_copy2, gray_copy3]
-    final_goodness = 0
-    
-    #iterate through binary images and see which fits the ellipse best
-    for i in range(1,4):
-        # Dilate the binary image
-        dilated_image = cv2.dilate(image_array[i-1], kernel, iterations=2)#medium
-        
-        # Find contours
-        contours, hierarchy = cv2.findContours(dilated_image, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-        # Create an empty image to draw contours
-        contour_img2 = np.zeros_like(dilated_image)
-        reduced_contours = filter_contours_by_area_and_return_largest(contours, 1000, 3)
-
-        if len(reduced_contours) > 0 and len(reduced_contours[0]) > 5:
+        if len(reduced_contours) > 0 and len(reduced_contours[0]) > cfg.MIN_POINTS_FOR_ELLIPSE:
             current_goodness = check_ellipse_goodness(dilated_image, reduced_contours[0], debug_mode_on)
-            #gray_copy = gray_frame.copy()
-            #cv2.drawContours(gray_copies[i-1], reduced_contours, -1, (255), 1)
             ellipse = cv2.fitEllipse(reduced_contours[0])
-            if debug_mode_on: #show contours 
-                cv2.imshow(name_array[i-1] + " threshold", gray_copies[i-1])
-                
-            #in total pixels, first element is pixel total, next is ratio
-            total_pixels = check_contour_pixels(reduced_contours[0], dilated_image.shape, debug_mode_on)                 
-            
-            cv2.ellipse(gray_copies[i-1], ellipse, (255, 0, 0), 2)  # Draw with specified color and thickness of 2
-            font = cv2.FONT_HERSHEY_SIMPLEX  # Font type
-            
-            final_goodness = current_goodness[0]*total_pixels[0]*total_pixels[0]*total_pixels[1]
-            
-            #show intermediary images with text output
+            total_pixels = check_contour_pixels(reduced_contours[0], dilated_image.shape, debug_mode_on)
+            final_goodness = current_goodness[0] * total_pixels[0] * total_pixels[0] * total_pixels[1]
             if debug_mode_on:
-                cv2.putText(gray_copies[i-1], "%filled:     " + str(current_goodness[0])[:5] + " (percentage of filled contour pixels inside ellipse)", (10,30), font, .55, (255,255,255), 1) #%filled
-                cv2.putText(gray_copies[i-1], "abs. pix:   " + str(total_pixels[0]) + " (total pixels under fit ellipse)", (10,50), font, .55, (255,255,255), 1    ) #abs pix
-                cv2.putText(gray_copies[i-1], "pix ratio:  " + str(total_pixels[1]) + " (total pix under fit ellipse / contour border pix)", (10,70), font, .55, (255,255,255), 1    ) #abs pix
-                cv2.putText(gray_copies[i-1], "final:     " + str(final_goodness) + " (filled*ratio)", (10,90), font, .55, (255,255,255), 1) #skewedness
-                cv2.imshow(name_array[i-1] + " threshold", image_array[i-1])
-                cv2.imshow(name_array[i-1], gray_copies[i-1])
-
-        if final_goodness > 0 and final_goodness > goodness: 
-            goodness = final_goodness
-            ellipse_reduced_contours = total_pixels[2]
-            best_image = image_array[i-1]
-            final_contours = reduced_contours
-            final_image = dilated_image
+                gray_copy = gray_frame.copy()
+                cv2.ellipse(gray_copy, ellipse, (255, 0, 0), 2)
+                cv2.putText(gray_copy, f"final: {final_goodness:.2f}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,255), 1)
+                cv2.imshow(f"threshold_{i}", gray_copy)
+            if final_goodness > goodness:
+                goodness = final_goodness
+                final_contours = reduced_contours
+    if TrackerConfig.ENABLE_TIMING:
+        timing_stats.add('contour', time.time() - t_start)
     
-    if debug_mode_on:
-        cv2.imshow("Reduced contours of best thresholded image", ellipse_reduced_contours)
-
-    test_frame = frame.copy()
-    
-    final_contours = [optimize_contours_by_angle(final_contours, gray_frame)]
-    
-    if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0] > 5):
-        #cv2.drawContours(test_frame, final_contours, -1, (255, 255, 255), 1)
-        ellipse = cv2.fitEllipse(final_contours[0])
-        final_rotated_rect = ellipse
-        cv2.ellipse(test_frame, ellipse, (55, 255, 0), 2)
-        #cv2.circle(test_frame, darkest_point, 3, (255, 125, 125), -1)
-        center_x, center_y = map(int, ellipse[0])
-        cv2.circle(test_frame, (center_x, center_y), 3, (255, 255, 0), -1)
-        cv2.putText(test_frame, "SPACE = play/pause", (10,410), cv2.FONT_HERSHEY_SIMPLEX, .55, (255,90,30), 2) #space
-        cv2.putText(test_frame, "Q      = quit", (10,430), cv2.FONT_HERSHEY_SIMPLEX, .55, (255,90,30), 2) #quit
-        cv2.putText(test_frame, "D      = show debug", (10,450), cv2.FONT_HERSHEY_SIMPLEX, .55, (255,90,30), 2) #debug
-
-    if render_cv_window:
-        cv2.imshow('best_thresholded_image_contours_on_frame', test_frame)
-    
-    # Create an empty image to draw contours
-    contour_img3 = np.zeros_like(image_array[i-1])
-    
-    if len(final_contours[0]) >= 5:
-        contour = np.array(final_contours[0], dtype=np.int32).reshape((-1, 1, 2)) #format for cv2.fitEllipse
-        ellipse = cv2.fitEllipse(contour) # Fit ellipse
-        cv2.ellipse(gray_frame, ellipse, (255,255,255), 2)  # Draw with white color and thickness of 2
-
-    #process_frames now returns a rotated rectangle for the ellipse for easy access
+    if render_cv_window or debug_mode_on:
+        t_viz = time.time() if TrackerConfig.ENABLE_TIMING else 0
+        test_frame = frame.copy()
+        final_contours = [optimize_contours_by_angle(final_contours, gray_frame)]
+        if final_contours and not isinstance(final_contours[0], list) and len(final_contours[0]) > cfg.MIN_POINTS_FOR_ELLIPSE:
+            ellipse = cv2.fitEllipse(final_contours[0])
+            final_rotated_rect = ellipse
+            if cfg.DRAW_ONLY_ESSENTIALS:
+                cv2.ellipse(test_frame, ellipse, (55, 255, 0), 2)
+                center_x, center_y = map(int, ellipse[0])
+                cv2.circle(test_frame, (center_x, center_y), 3, (255, 255, 0), -1)
+            cv2.putText(test_frame, "SPACE=pause Q=quit D=debug", (10, test_frame.shape[0]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,90,30), 1)
+        if render_cv_window:
+            cv2.imshow('Pupil Tracker', test_frame)
+        if TrackerConfig.ENABLE_TIMING:
+            timing_stats.add('viz', time.time() - t_viz)
     return final_rotated_rect
 
 
@@ -495,99 +435,112 @@ def process_frame(frame, use_face_detection=True, draw_debug=False):
     
     return final_rotated_rect
 
-# Loads a video and finds the pupil in each frame
 def process_video(video_path, input_method):
-
-    fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Codec for MP4 format
-    out = cv2.VideoWriter('C:/Storage/Source Videos/output_video.mp4', fourcc, 30.0, (640, 480))  # Output video filename, codec, frame rate, and frame size
-
+    cfg = TrackerConfig
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter('C:/Storage/Source Videos/output_video.mp4', fourcc, 30.0, (cfg.CAMERA_WIDTH, cfg.CAMERA_HEIGHT))
     if input_method == 1:
         cap = cv2.VideoCapture(video_path)
     elif input_method == 2:
-        cap = cv2.VideoCapture(00, cv2.CAP_DSHOW)  # Camera input
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.CAMERA_HEIGHT)
         cap.set(cv2.CAP_PROP_EXPOSURE, -5)
+        if cfg.FORCE_GRAYSCALE:
+            cap.set(cv2.CAP_PROP_CONVERT_RGB, 0)
     else:
-        print("Invalid video source.")
         return
-
     if not cap.isOpened():
-        print("Error: Could not open video.")
         return
-    
     debug_mode_on = False
-    use_face_detection = True  # Toggle face detection on/off
-    
-    temp_center = (0,0)
-
+    use_face_detection = True
+    frame_count = 0
+    cached_roi = None
+    timing_stats.reset()
     while True:
+        t_frame_start = time.time() if cfg.ENABLE_TIMING else 0
+        t_cap = time.time() if cfg.ENABLE_TIMING else 0
         ret, frame = cap.read()
         if not ret:
             break
-
-        # Process frame with optional face detection
-        full_frame_copy = frame.copy()  # Keep copy for display
+        if cfg.ENABLE_TIMING:
+            timing_stats.add('capture', time.time() - t_cap)
+        t_roi = time.time() if cfg.ENABLE_TIMING else 0
+        if cfg.FORCE_GRAYSCALE and len(frame.shape) == 3:
+            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        elif len(frame.shape) == 2:
+            gray_full = frame
+        else:
+            gray_full = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         eye_offset = (0, 0)
-        
-        # Try face/eye detection first
+        current_roi = None
         if use_face_detection and FACE_DETECTION_AVAILABLE:
-            eye_regions = detect_face_and_eyes(frame, draw_rectangles=debug_mode_on)
-            
-            if eye_regions is not None and len(eye_regions) > 0:
-                ex, ey, ew, eh = eye_regions[0]
-                frame = frame[ey:ey+eh, ex:ex+ew]
-                eye_offset = (ex, ey)
-
-        # Crop and resize frame
-        frame = crop_to_aspect_ratio(frame)
-
-        #find the darkest point
-        darkest_point = get_darkest_area(frame)
-
-        if debug_mode_on:
-            darkest_image = frame.copy()
-            cv2.circle(darkest_image, darkest_point, 10, (0, 0, 255), -1)
-            cv2.imshow('Darkest image patch', darkest_image)
-
-        # Convert to grayscale to handle pixel value operations
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if frame_count % cfg.FACE_DETECTION_INTERVAL == 0:
+                eye_regions = detect_face_and_eyes(gray_full, draw_rectangles=debug_mode_on)
+                if eye_regions is not None and len(eye_regions) > 0:
+                    cached_roi = eye_regions[0]
+                    current_roi = cached_roi
+                else:
+                    cached_roi = None
+            else:
+                current_roi = cached_roi
+            if current_roi is not None:
+                ex, ey, ew, eh = current_roi
+                ex = max(0, ex)
+                ey = max(0, ey)
+                ew = min(ew, gray_full.shape[1] - ex)
+                eh = min(eh, gray_full.shape[0] - ey)
+                if ew >= cfg.ROI_MIN_SIZE and eh >= cfg.ROI_MIN_SIZE:
+                    gray_frame = gray_full[ey:ey+eh, ex:ex+ew]
+                    eye_offset = (ex, ey)
+                else:
+                    gray_frame = gray_full
+            else:
+                gray_frame = gray_full
+        else:
+            gray_frame = gray_full
+        if cfg.ENABLE_TIMING:
+            timing_stats.add('roi', time.time() - t_roi)
+        t_prep = time.time() if cfg.ENABLE_TIMING else 0
+        gray_frame = crop_to_aspect_ratio(gray_frame, cfg.CAMERA_WIDTH, cfg.CAMERA_HEIGHT)
+        darkest_point = get_darkest_area(gray_frame)
         darkest_pixel_value = gray_frame[darkest_point[1], darkest_point[0]]
-        
-        # apply thresholding operations at different levels
-        # at least one should give us a good ellipse segment
-        thresholded_image_strict = apply_binary_threshold(gray_frame, darkest_pixel_value, 5)#lite
-        thresholded_image_strict = mask_outside_square(thresholded_image_strict, darkest_point, 250)
-
-        thresholded_image_medium = apply_binary_threshold(gray_frame, darkest_pixel_value, 15)#medium
-        thresholded_image_medium = mask_outside_square(thresholded_image_medium, darkest_point, 250)
-        
-        thresholded_image_relaxed = apply_binary_threshold(gray_frame, darkest_pixel_value, 25)#heavy
-        thresholded_image_relaxed = mask_outside_square(thresholded_image_relaxed, darkest_point, 250)
-        
-        #take the three images thresholded at different levels and process them
-        pupil_rotated_rect = process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame, gray_frame, darkest_point, debug_mode_on, True)
-        
+        thresholded_image_strict = apply_binary_threshold(gray_frame, darkest_pixel_value, cfg.THRESHOLD_STRICT)
+        thresholded_image_strict = mask_outside_square(thresholded_image_strict, darkest_point, cfg.MASK_SIZE)
+        thresholded_image_medium = apply_binary_threshold(gray_frame, darkest_pixel_value, cfg.THRESHOLD_MEDIUM)
+        thresholded_image_medium = mask_outside_square(thresholded_image_medium, darkest_point, cfg.MASK_SIZE)
+        thresholded_image_relaxed = apply_binary_threshold(gray_frame, darkest_pixel_value, cfg.THRESHOLD_RELAXED)
+        thresholded_image_relaxed = mask_outside_square(thresholded_image_relaxed, darkest_point, cfg.MASK_SIZE)
+        if cfg.ENABLE_TIMING:
+            timing_stats.add('preprocess', time.time() - t_prep)
+        if len(gray_frame.shape) == 2:
+            frame_vis = cv2.cvtColor(gray_frame, cv2.COLOR_GRAY2BGR)
+        else:
+            frame_vis = gray_frame
+        pupil_rotated_rect = process_frames(thresholded_image_strict, thresholded_image_medium, thresholded_image_relaxed, frame_vis, gray_frame, darkest_point, debug_mode_on, True)
+        if cfg.ENABLE_TIMING:
+            timing_stats.add('total', time.time() - t_frame_start)
+        if cfg.ENABLE_TIMING and frame_count > 0 and frame_count % cfg.TIMING_LOG_INTERVAL == 0:
+            avgs = timing_stats.get_averages()
+            fps = 1.0 / avgs['total'] if avgs['total'] > 0 else 0
+            print(f"[Frame {frame_count}] FPS: {fps:.1f} | Capture: {avgs['capture']*1000:.1f}ms | ROI: {avgs['roi']*1000:.1f}ms | Preprocess: {avgs['preprocess']*1000:.1f}ms | Contour: {avgs['contour']*1000:.1f}ms | Viz: {avgs['viz']*1000:.1f}ms")
+            timing_stats.reset()
+        frame_count += 1
         key = cv2.waitKey(1) & 0xFF
-        
-        if key == ord('d') and debug_mode_on == False:  # Press 'd' to start debug mode
-            debug_mode_on = True
-        elif key == ord('d') and debug_mode_on == True:
-            debug_mode_on = False
-            cv2.destroyAllWindows()
-        elif key == ord('f'):  # Press 'f' to toggle face detection
+        if key == ord('d'):
+            debug_mode_on = not debug_mode_on
+            if not debug_mode_on:
+                cv2.destroyAllWindows()
+        elif key == ord('f'):
             use_face_detection = not use_face_detection
-            status = "ON" if use_face_detection else "OFF"
-            print(f"Face detection: {status}")
-        if key == ord('q'):  # Press 'q' to quit
+        elif key == ord('q'):
             out.release()
-            break   
-        elif key == ord(' '):  # Press spacebar to start/stop
+            break
+        elif key == ord(' '):
             while True:
                 key = cv2.waitKey(1) & 0xFF
-                if key == ord(' '):  # Press spacebar again to resume
+                if key == ord(' ') or key == ord('q'):
                     break
-                elif key == ord('q'):  # Press 'q' to quit
-                    break
-
     cap.release()
     out.release()
     cv2.destroyAllWindows()
